@@ -1,6 +1,5 @@
 use crate::fan_config::*;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 
 pub struct FanController {
     buffer: VecDeque<f32>,
@@ -14,7 +13,7 @@ impl FanController {
     }
 
     pub fn update(&mut self, temperature: f32, strategy: &Strategy) -> f32 {
-        let mut fan_speed = self.interpolate(temperature, strategy);
+        let fan_speed: f32 = self.interpolate(temperature, strategy);
 
         // add to buffer
         self.buffer.push_back(fan_speed);
@@ -30,7 +29,6 @@ impl FanController {
             return 0.0;
         }
 
-        let cut = std::cmp::max(1, len / 5);
         let trimmed: &[f32] = if len > 2 {
             let cut = std::cmp::max(1, len / 5);
             &values[cut..len - cut]
@@ -64,9 +62,5 @@ impl FanController {
         }
 
         points.last().unwrap().speed
-    }
-
-    pub fn reset_buffer(&mut self) {
-        self.buffer.clear();
     }
 }

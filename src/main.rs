@@ -1,5 +1,4 @@
 use std::env;
-use std::fmt::format;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -216,22 +215,45 @@ fn run_daemon() -> std::io::Result<()> {
                         let msg = format!("Unknown strategy: {}", name);
                         stream.write_all(msg.as_bytes())?;
                     }
+                }
+                if received_trimmed == "print" {
+                    let name_lock = strategy_name.lock().unwrap();
+                    let fan_speed = fan_speed_shared.lock().unwrap();
+                    let active = paused_listener.lock().unwrap();
+
+                    let status = Status {
+                        strategy: &name_lock,
+                        speed: *fan_speed,
+                        active: *active,
+                    };
+
+                    let msg = format!(
+                        "Strategy: {}\nSpeed: {}\nActive: {}",
+                        status.strategy, status.speed, status.active
+                    );
+
+                    stream.write_all(msg.as_bytes())?;
                 } else if let Some(arguments) = received_trimmed.strip_prefix("print ") {
-                    {
-                        let profile = current_strategy.lock().unwrap();
-                        let name_lock = strategy_name.lock().unwrap();
-                        let fan_speed = fan_speed_shared.lock().unwrap();
-                        let active = paused_listener.lock().unwrap();
+                    let name_lock = strategy_name.lock().unwrap();
+                    let fan_speed = fan_speed_shared.lock().unwrap();
+                    let active = paused_listener.lock().unwrap();
 
-                        let status = Status {
-                            strategy: &name_lock,
-                            speed: *fan_speed,
-                            active: *active,
-                        };
+                    let status = Status {
+                        strategy: &name_lock,
+                        speed: *fan_speed,
+                        active: *active,
+                    };
 
-                        let msg = format!("{}", serde_json::to_string(&status).unwrap());
-                        stream.write_all(msg.as_bytes())?;
-                    }
+                    let msg = if arguments.trim() == "json" {
+                        serde_json::to_string(&status).unwrap()
+                    } else {
+                        format!(
+                            "Strategy: {}\nSpeed: {}\nActive: {}",
+                            status.strategy, status.speed, status.active
+                        )
+                    };
+
+                    stream.write_all(msg.as_bytes())?;
                 } else if let Some(arguments) = received_trimmed.strip_prefix("tool ") {
                     let mut cmd = Command::new("framework_tool");
                     for arg in arguments.split_whitespace() {
@@ -281,10 +303,30 @@ fn send_to_daemon(msg: String) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf[..n]).to_string())
 }
 
+fn print_help() {
+    println!(
+        "Usage:
+    run             Start the fan control daemon (requires root)
+    use <strategy>  Switch to a fan strategy
+    print <format>  Show current strategy, fan speed, and status format can be json and human
+    reset           Reset strategy to default
+    pause           Pause fan control
+    resume          Resume fan control
+    reload          Reload config
+    tool <args>     Run arbitrary framework_tool commands
+    --help          Show this help message"
+    );
+}
+
 fn main() {
     env_logger::init();
 
     let args: Vec<String> = env::args().collect();
+
+    if args.len() > 1 && (args[1] == "--help" || args[1] == "help") {
+        print_help();
+        return;
+    }
 
     if args.len() > 1 && args[1] == "run" {
         if unsafe { libc::geteuid() != 0 } {
