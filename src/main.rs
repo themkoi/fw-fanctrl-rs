@@ -308,13 +308,13 @@ fn print_help() {
         "Usage:
     run             Start the fan control daemon (requires root)
     use <strategy>  Switch to a fan strategy
-    print <format>  Show current strategy, fan speed, and status format can be json and human
+    print <format>  Show current strategy, fan speed, and status (format can be json or human)
     reset           Reset strategy to default
     pause           Pause fan control
     resume          Resume fan control
     reload          Reload config
     tool <args>     Run arbitrary framework_tool commands
-    --help          Show this help message"
+    help / --help   Show this help message"
     );
 }
 
