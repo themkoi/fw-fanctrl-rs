@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-mod default;
+pub mod default;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SpeedPoint {

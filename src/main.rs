@@ -10,12 +10,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use log::{info, warn, error, debug};
 use crate::fan_config::Strategy;
+use crate::fan_control::FanController;
+use log::{debug, error, info, warn};
 
 const SOCK_PATH: &str = "/tmp/fw-fanctrl-rs.sock";
 
 mod fan_config;
+mod fan_control;
 
 #[derive(Debug)]
 struct TempParsed {
@@ -45,7 +47,9 @@ fn parse_temp(input: &str) -> TempParsed {
 
     for line in input.lines() {
         let line = line.trim();
-        if line.is_empty() { continue }
+        if line.is_empty() {
+            continue;
+        }
 
         let to_val = |s: &str| s.parse::<u32>().ok();
 
@@ -97,12 +101,22 @@ fn run_daemon() -> std::io::Result<()> {
     {
         let name = strategy_name.lock().unwrap();
         let mut profile = current_strategy.lock().unwrap();
-        *profile = config.strategies.get(&*name).expect("Missing default").clone();
+        *profile = config
+            .strategies
+            .get(&*name)
+            .expect("Missing default")
+            .clone();
     }
+    let controller = {
+        let profile = current_strategy.lock().unwrap(); // lock temporarily
+        FanController::new(&profile) // use profile
+    }; // lock is automatically dropped here
+    let controller = Arc::new(Mutex::new(controller));
 
     loop {
         let profile_fan_clone = Arc::clone(&current_strategy);
         let strategy_name_clone = Arc::clone(&strategy_name);
+        let controller_clone = Arc::clone(&controller);
 
         let _fan_thread = thread::spawn(move || loop {
             let sleep_time;
@@ -122,8 +136,27 @@ fn run_daemon() -> std::io::Result<()> {
 
                 let stdout = String::from_utf8_lossy(&temp.stdout);
                 let parsed = parse_temp(&stdout);
-
                 debug!("{:?}", parsed);
+                let temperature: f32;
+                if parsed.apu > parsed.dgpu_temp {
+                    temperature = parsed.apu.map(|v| v as f32).unwrap_or(0.0);
+                } else {
+                    temperature = parsed.dgpu_temp.map(|v| v as f32).unwrap_or(0.0);
+                }
+                debug!("temp: {:?}", temperature);
+                let fan_speed = {
+                    let mut ctrl = controller_clone.lock().unwrap();
+                    ctrl.update(temperature, &profile)
+                };
+                let fan_speed_full: u8 = fan_speed as u8;
+                println!("Fan speed: {}", fan_speed_full);
+                let output = Command::new("framework_tool")
+                    .arg("--fansetduty")
+                    .arg(fan_speed_full.to_string())
+                    .output()
+                    .expect("framework_tool failed");
+                let stderr = str::from_utf8(&output.stderr).unwrap_or("<invalid utf8>");
+                println!("stderr: {}", stderr);
             }
 
             thread::sleep(Duration::from_secs_f32(sleep_time));
