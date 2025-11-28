@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt::format;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -83,7 +84,7 @@ fn run_daemon() -> std::io::Result<()> {
     if Path::new(SOCK_PATH).exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            "daemon already running",
+            "daemon already running Socket already exsists?",
         ));
     }
 
@@ -112,65 +113,77 @@ fn run_daemon() -> std::io::Result<()> {
         FanController::new(&profile) // use profile
     }; // lock is automatically dropped here
     let controller = Arc::new(Mutex::new(controller));
+    let profile_fan_clone = Arc::clone(&current_strategy);
+    let strategy_name_clone = Arc::clone(&strategy_name);
+    let controller_clone = Arc::clone(&controller);
+    let paused = Arc::new(Mutex::new(false));
+    let paused_thread = paused.clone();
+
+    let fan_thread = thread::spawn(move || loop {
+        let sleep_time;
+        {
+            let is_paused = paused_thread.lock().unwrap();
+            if *is_paused {
+                drop(is_paused);
+                thread::park();
+                continue;
+            }
+        }
+
+        {
+            let profile = profile_fan_clone.lock().unwrap();
+            let name = strategy_name_clone.lock().unwrap();
+            sleep_time = profile.fan_speed_update_frequency;
+
+            debug!("Update freq: {}", profile.fan_speed_update_frequency);
+            debug!("Strategy: {}", *name);
+
+            let temp = Command::new("framework_tool")
+                .arg("--thermal")
+                .output()
+                .expect("framework_tool failed");
+
+            let stdout = String::from_utf8_lossy(&temp.stdout);
+            let parsed = parse_temp(&stdout);
+            debug!("{:?}", parsed);
+            let temperature: f32;
+            if parsed.apu > parsed.dgpu_temp {
+                temperature = parsed.apu.map(|v| v as f32).unwrap_or(0.0);
+            } else {
+                temperature = parsed.dgpu_temp.map(|v| v as f32).unwrap_or(0.0);
+            }
+            debug!("temp: {:?}", temperature);
+            let fan_speed = {
+                let mut ctrl = controller_clone.lock().unwrap();
+                ctrl.update(temperature, &profile)
+            };
+            let fan_speed_full: u8 = fan_speed as u8;
+            debug!("Fan speed: {}", fan_speed_full);
+            let output = Command::new("framework_tool")
+                .arg("--fansetduty")
+                .arg(fan_speed_full.to_string())
+                .output()
+                .expect("framework_tool failed");
+            let stderr = str::from_utf8(&output.stderr).unwrap_or("<invalid utf8>");
+            debug!("stderr: {}", stderr);
+        }
+
+        thread::sleep(Duration::from_secs_f32(sleep_time));
+    });
 
     loop {
-        let profile_fan_clone = Arc::clone(&current_strategy);
-        let strategy_name_clone = Arc::clone(&strategy_name);
-        let controller_clone = Arc::clone(&controller);
-
-        let _fan_thread = thread::spawn(move || loop {
-            let sleep_time;
-
-            {
-                let profile = profile_fan_clone.lock().unwrap();
-                let name = strategy_name_clone.lock().unwrap();
-                sleep_time = profile.fan_speed_update_frequency;
-
-                debug!("Update freq: {}", profile.fan_speed_update_frequency);
-                debug!("Strategy: {}", *name);
-
-                let temp = Command::new("framework_tool")
-                    .arg("--thermal")
-                    .output()
-                    .expect("framework_tool failed");
-
-                let stdout = String::from_utf8_lossy(&temp.stdout);
-                let parsed = parse_temp(&stdout);
-                debug!("{:?}", parsed);
-                let temperature: f32;
-                if parsed.apu > parsed.dgpu_temp {
-                    temperature = parsed.apu.map(|v| v as f32).unwrap_or(0.0);
-                } else {
-                    temperature = parsed.dgpu_temp.map(|v| v as f32).unwrap_or(0.0);
-                }
-                debug!("temp: {:?}", temperature);
-                let fan_speed = {
-                    let mut ctrl = controller_clone.lock().unwrap();
-                    ctrl.update(temperature, &profile)
-                };
-                let fan_speed_full: u8 = fan_speed as u8;
-                println!("Fan speed: {}", fan_speed_full);
-                let output = Command::new("framework_tool")
-                    .arg("--fansetduty")
-                    .arg(fan_speed_full.to_string())
-                    .output()
-                    .expect("framework_tool failed");
-                let stderr = str::from_utf8(&output.stderr).unwrap_or("<invalid utf8>");
-                println!("stderr: {}", stderr);
-            }
-
-            thread::sleep(Duration::from_secs_f32(sleep_time));
-        });
+        let paused_listener = paused.clone();
 
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 1024];
 
             if let Ok(n) = stream.read(&mut buf) {
                 let received = String::from_utf8_lossy(&buf[..n]).to_string();
+                let received_trimmed = received.trim();
 
-                if let Some(name) = received.strip_prefix("use ") {
+                if let Some(name) = received_trimmed.strip_prefix("use ") {
                     let name = name.trim();
-                    info!("received: {}", received);
+                    info!("received: {}", received_trimmed);
 
                     if config.strategies.contains_key(name) {
                         {
@@ -190,6 +203,31 @@ fn run_daemon() -> std::io::Result<()> {
                         let msg = format!("Unknown strategy: {}", name);
                         stream.write_all(msg.as_bytes())?;
                     }
+                } else if let Some(arguments) = received_trimmed.strip_prefix("tool ") {
+                    let mut cmd = Command::new("framework_tool");
+                    for arg in arguments.split_whitespace() {
+                        cmd.arg(arg);
+                    }
+                    let output = cmd.output().expect("framework_tool failed");
+                    let stderr = std::str::from_utf8(&output.stderr).unwrap_or("<invalid utf8>");
+                    stream.write_all(stderr.as_bytes())?;
+                } else if received_trimmed == "reset" {
+                    let mut profile = current_strategy.lock().unwrap();
+                    *profile = config.strategies[&config.default_strategy.clone()].clone();
+                    let msg = format!(
+                        "Strategy reset to default! Strategy in use: {}",
+                        config.default_strategy
+                    );
+                    stream.write_all(msg.as_bytes())?;
+                } else if received_trimmed == "pause" {
+                    let mut pause = paused_listener.lock().unwrap();
+                    *pause = true;
+                    stream.write_all(b"Service paused!")?;
+                } else if received_trimmed == "resume" {
+                    let mut pause = paused_listener.lock().unwrap();
+                    *pause = false;
+                    fan_thread.thread().unpark();
+                    stream.write_all(b"Service resumed!")?;
                 } else {
                     stream.write_all(b"unknown or unfinished argument")?;
                 }
