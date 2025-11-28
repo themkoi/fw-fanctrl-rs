@@ -6,11 +6,11 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::exit;
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use log::{info, warn, error, debug};
 use crate::fan_config::Strategy;
 
 const SOCK_PATH: &str = "/tmp/fw-fanctrl-rs.sock";
@@ -45,9 +45,7 @@ fn parse_temp(input: &str) -> TempParsed {
 
     for line in input.lines() {
         let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+        if line.is_empty() { continue }
 
         let to_val = |s: &str| s.parse::<u32>().ok();
 
@@ -90,53 +88,56 @@ fn run_daemon() -> std::io::Result<()> {
 
     let config = fan_config::load_or_create_config().unwrap();
     let strategy_name = Arc::new(Mutex::new(config.default_strategy.clone()));
-    let current_strategy = Arc::new(Mutex::new(fan_config::Strategy {
+    let current_strategy = Arc::new(Mutex::new(Strategy {
         fan_speed_update_frequency: 2.0,
         moving_average_interval: 30,
         speed_curve: vec![],
     }));
-    let profile_fan_clone_tmp = Arc::clone(&current_strategy);
+
     {
         let name = strategy_name.lock().unwrap();
-
-        let mut profile = profile_fan_clone_tmp.lock().unwrap();
-        *profile = config
-            .strategies
-            .get(&*name)
-            .expect("Default strategy not found")
-            .clone();
-    } // lock released here
-    drop(profile_fan_clone_tmp);
+        let mut profile = current_strategy.lock().unwrap();
+        *profile = config.strategies.get(&*name).expect("Missing default").clone();
+    }
 
     loop {
         let profile_fan_clone = Arc::clone(&current_strategy);
         let strategy_name_clone = Arc::clone(&strategy_name);
-        let fan_thread = thread::spawn(move || loop {
+
+        let _fan_thread = thread::spawn(move || loop {
             let sleep_time;
+
             {
-            let profile = profile_fan_clone.lock().unwrap();
-            let name = strategy_name_clone.lock().unwrap();
-            sleep_time = profile.fan_speed_update_frequency;
-            println!("Value: {}", profile.fan_speed_update_frequency); // read safely
-            println!("Selected strategy: {}", *name);
-            let temp = Command::new("framework_tool")
-                .arg("--thermal")
-                .output()
-                .expect("failed to run tool");
+                let profile = profile_fan_clone.lock().unwrap();
+                let name = strategy_name_clone.lock().unwrap();
+                sleep_time = profile.fan_speed_update_frequency;
 
-            let stdout = String::from_utf8_lossy(&temp.stdout);
-            let parsed = parse_temp(&stdout);
+                debug!("Update freq: {}", profile.fan_speed_update_frequency);
+                debug!("Strategy: {}", *name);
 
-            println!("{:#?}", parsed);
-        }
+                let temp = Command::new("framework_tool")
+                    .arg("--thermal")
+                    .output()
+                    .expect("framework_tool failed");
+
+                let stdout = String::from_utf8_lossy(&temp.stdout);
+                let parsed = parse_temp(&stdout);
+
+                debug!("{:?}", parsed);
+            }
+
             thread::sleep(Duration::from_secs_f32(sleep_time));
         });
+
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = String::new();
-            if stream.read_to_string(&mut buf).is_ok() {
-                if let Some(name) = buf.strip_prefix("use ") {
+            let mut buf = [0u8; 1024];
+
+            if let Ok(n) = stream.read(&mut buf) {
+                let received = String::from_utf8_lossy(&buf[..n]).to_string();
+
+                if let Some(name) = received.strip_prefix("use ") {
                     let name = name.trim();
-                    println!("received: {}", buf);
+                    info!("received: {}", received);
 
                     if config.strategies.contains_key(name) {
                         {
@@ -148,40 +149,53 @@ fn run_daemon() -> std::io::Result<()> {
                             *profile = config.strategies[name].clone();
                         }
 
-                        println!("Switched to strategy: {}", name);
+                        info!("Switched to strategy: {}", name);
+                        let msg = format!("Switched to strategy: {}", name);
+                        stream.write_all(msg.as_bytes())?;
                     } else {
-                        println!("Unknown strategy: {}", name);
+                        warn!("Unknown strategy: {}", name);
+                        let msg = format!("Unknown strategy: {}", name);
+                        stream.write_all(msg.as_bytes())?;
                     }
+                } else {
+                    stream.write_all(b"unknown or unfinished argument")?;
                 }
             }
         }
     }
 }
 
-fn send_to_daemon(msg: String) -> std::io::Result<()> {
+fn send_to_daemon(msg: String) -> std::io::Result<String> {
     let mut stream = UnixStream::connect(SOCK_PATH)?;
     stream.write_all(msg.as_bytes())?;
-    Ok(())
+
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf[..n]).to_string())
 }
 
 fn main() {
+    env_logger::init();
+
     let args: Vec<String> = env::args().collect();
 
     if args.len() > 1 && args[1] == "run" {
         if unsafe { libc::geteuid() != 0 } {
-            eprintln!("This program needs root privileges to run.");
+            error!("Root privileges required.");
             exit(1);
         }
+
         if let Err(e) = run_daemon() {
-            eprintln!("failed: {}", e);
+            error!("failed: {}", e);
         }
         return;
     }
 
     if args.len() > 1 {
         let msg = args[1..].join(" ");
-        if let Err(e) = send_to_daemon(msg) {
-            eprintln!("failed: {}", e);
+        match send_to_daemon(msg) {
+            Ok(response) => println!("{}", response),
+            Err(e) => error!("failed: {}", e),
         }
     }
 }

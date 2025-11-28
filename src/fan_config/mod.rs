@@ -1,5 +1,4 @@
-use ron::de::from_str;
-use ron::ser::{to_string_pretty, PrettyConfig};
+use ron::ser::{to_string_pretty};
 use config::{Config as ConfigLoader, File};
 use serde::{Deserialize, Serialize};
 use std::fs;
