@@ -14,6 +14,7 @@ use std::time::Duration;
 use crate::fan_config::Strategy;
 use crate::fan_control::FanController;
 use log::{debug, error, info, warn};
+use serde::Serialize;
 
 const SOCK_PATH: &str = "/tmp/fw-fanctrl-rs.sock";
 
@@ -31,6 +32,13 @@ struct TempParsed {
     dgpu_amb: Option<u32>,
     dgpu_temp: Option<u32>,
     fan_speeds: Vec<u32>,
+}
+
+#[derive(Serialize)]
+struct Status<'a> {
+    strategy: &'a str,
+    speed: u8,
+    active: bool,
 }
 
 fn parse_temp(input: &str) -> TempParsed {
@@ -91,7 +99,7 @@ fn run_daemon() -> std::io::Result<()> {
     let listener = UnixListener::bind(SOCK_PATH)?;
     fs::set_permissions(SOCK_PATH, fs::Permissions::from_mode(0o666))?;
 
-    let config = fan_config::load_or_create_config().unwrap();
+    let mut config = fan_config::load_or_create_config().unwrap();
     let strategy_name = Arc::new(Mutex::new(config.default_strategy.clone()));
     let current_strategy = Arc::new(Mutex::new(Strategy {
         fan_speed_update_frequency: 2.0,
@@ -118,7 +126,8 @@ fn run_daemon() -> std::io::Result<()> {
     let controller_clone = Arc::clone(&controller);
     let paused = Arc::new(Mutex::new(false));
     let paused_thread = paused.clone();
-
+    let fan_speed_shared = Arc::new(Mutex::new(0u8));
+    let fan_speed_thread = Arc::clone(&fan_speed_shared);
     let fan_thread = thread::spawn(move || loop {
         let sleep_time;
         {
@@ -158,6 +167,10 @@ fn run_daemon() -> std::io::Result<()> {
                 ctrl.update(temperature, &profile)
             };
             let fan_speed_full: u8 = fan_speed as u8;
+            {
+                let mut fan_speed_lock = fan_speed_thread.lock().unwrap();
+                *fan_speed_lock = fan_speed_full;
+            }
             debug!("Fan speed: {}", fan_speed_full);
             let output = Command::new("framework_tool")
                 .arg("--fansetduty")
@@ -203,6 +216,22 @@ fn run_daemon() -> std::io::Result<()> {
                         let msg = format!("Unknown strategy: {}", name);
                         stream.write_all(msg.as_bytes())?;
                     }
+                } else if let Some(arguments) = received_trimmed.strip_prefix("print ") {
+                    {
+                        let profile = current_strategy.lock().unwrap();
+                        let name_lock = strategy_name.lock().unwrap();
+                        let fan_speed = fan_speed_shared.lock().unwrap();
+                        let active = paused_listener.lock().unwrap();
+
+                        let status = Status {
+                            strategy: &name_lock,
+                            speed: *fan_speed,
+                            active: *active,
+                        };
+
+                        let msg = format!("{}", serde_json::to_string(&status).unwrap());
+                        stream.write_all(msg.as_bytes())?;
+                    }
                 } else if let Some(arguments) = received_trimmed.strip_prefix("tool ") {
                     let mut cmd = Command::new("framework_tool");
                     for arg in arguments.split_whitespace() {
@@ -220,6 +249,10 @@ fn run_daemon() -> std::io::Result<()> {
                     );
                     stream.write_all(msg.as_bytes())?;
                 } else if received_trimmed == "pause" {
+                    Command::new("framework_tool")
+                        .arg("--autofanctrl")
+                        .output()
+                        .expect("framework_tool failed");
                     let mut pause = paused_listener.lock().unwrap();
                     *pause = true;
                     stream.write_all(b"Service paused!")?;
@@ -228,6 +261,9 @@ fn run_daemon() -> std::io::Result<()> {
                     *pause = false;
                     fan_thread.thread().unpark();
                     stream.write_all(b"Service resumed!")?;
+                } else if received_trimmed == "reload" {
+                    config = fan_config::load_or_create_config().unwrap();
+                    stream.write_all(b"Config reloaded")?;
                 } else {
                     stream.write_all(b"unknown or unfinished argument")?;
                 }

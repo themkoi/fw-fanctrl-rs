@@ -282,6 +282,7 @@ dependencies = [
  "log",
  "ron",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
