@@ -8,6 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::exit;
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -38,10 +39,10 @@ struct TempParsed {
 }
 
 #[derive(Serialize)]
-struct Status<'a> {
-    strategy: &'a str,
+struct Status {
+    strategy: String,
     speed: u8,
-    active: bool,
+    paused: bool,
 }
 
 fn parse_temp(input: &str) -> TempParsed {
@@ -91,6 +92,28 @@ fn parse_temp(input: &str) -> TempParsed {
     out
 }
 
+lazy_static::lazy_static! {
+    static ref BROADCAST_LOCK: Mutex<()> = Mutex::new(());
+}
+
+fn broadcast_status(clients: &Arc<Mutex<Vec<UnixStream>>>, status: &Status) {
+    let _guard = BROADCAST_LOCK.lock().unwrap(); // only one broadcast at a time
+
+    if let Ok(msg) = serde_json::to_string(status) {
+        let mut clients_lock = clients.lock().unwrap();
+        clients_lock.retain(|mut client| {
+            if let Err(e) = client.write_all(format!("{}\n", msg).as_bytes()) {
+                eprintln!("Client disconnected: {}", e);
+                false
+            } else {
+                true
+            }
+        });
+    } else {
+        eprintln!("Failed to serialize status");
+    }
+}
+
 fn run_daemon() -> std::io::Result<()> {
     if Path::new(SOCK_PATH).exists() {
         return Err(std::io::Error::new(
@@ -105,6 +128,8 @@ fn run_daemon() -> std::io::Result<()> {
             "daemon already running Socket already exsists?",
         ));
     }
+    let (status_tx, status_rx) = mpsc::channel::<Status>();
+    let status_tx = Arc::new(status_tx);
     let clients = Arc::new(Mutex::new(Vec::new()));
     let info_listener = UnixListener::bind(SOCK_INFO_PATH)?;
     fs::set_permissions(SOCK_INFO_PATH, fs::Permissions::from_mode(0o666))?;
@@ -118,6 +143,29 @@ fn run_daemon() -> std::io::Result<()> {
                     clients_lock.push(stream);
                 }
                 Err(e) => eprintln!("Failed to accept client: {}", e),
+            }
+        }
+    });
+
+    let clients_clone = Arc::clone(&clients);
+
+    thread::spawn(move || {
+        let clients_lock = clients_clone.lock().unwrap();
+        drop(clients_lock); // release lock initially
+
+        for status in status_rx {
+            if let Ok(msg) = serde_json::to_string(&status) {
+                let mut clients_lock = clients.lock().unwrap();
+                clients_lock.retain(|mut client| {
+                    if let Err(e) = client.write_all(format!("{}\n", msg).as_bytes()) {
+                        eprintln!("Client disconnected: {}", e);
+                        false // remove disconnected client
+                    } else {
+                        true
+                    }
+                });
+            } else {
+                eprintln!("Failed to serialize status");
             }
         }
     });
@@ -157,31 +205,29 @@ fn run_daemon() -> std::io::Result<()> {
     let mut last_strategy = String::new();
     let mut last_speed = 0;
     let mut last_active = false;
+
+    let status_tx_fan = Arc::clone(&status_tx);
+
     let fan_thread = thread::spawn(move || loop {
         {
             info!("checking changes");
             let name_lock = strategy_name_clone.lock().unwrap();
             let fan_speed = fan_speed_thread.lock().unwrap();
-            let active = paused_thread.lock().unwrap();
+            let paused = paused_thread.lock().unwrap();
 
-            if &last_strategy != &*name_lock || last_speed != *fan_speed || last_active != *active {
+            if &last_strategy != &*name_lock || last_speed != *fan_speed || last_active != *paused {
                 info!("changes detected writing to socket");
                 let status = Status {
-                    strategy: &name_lock,
+                    strategy: (name_lock).to_string(),
                     speed: *fan_speed,
-                    active: *active,
+                    paused: *paused,
                 };
 
-                if let Ok(msg) = serde_json::to_string(&status) {
-                    let mut clients_lock = clients.lock().unwrap();
-                    clients_lock.retain(|mut client| client.write_all(format!("{}\n", msg).as_bytes()).is_ok());
-                } else {
-                    eprintln!("Failed to serialize status");
-                }
+                let _ = status_tx_fan.send(status);
 
                 last_strategy = name_lock.clone();
                 last_speed = *fan_speed;
-                last_active = *active;
+                last_active = *paused;
             }
         }
 
@@ -240,6 +286,7 @@ fn run_daemon() -> std::io::Result<()> {
         thread::sleep(Duration::from_secs_f32(sleep_time));
     });
 
+    let status_tx_listener = Arc::clone(&status_tx);
     loop {
         let paused_listener = paused.clone();
 
@@ -276,12 +323,12 @@ fn run_daemon() -> std::io::Result<()> {
                 if received_trimmed == "print" {
                     let name_lock = strategy_name.lock().unwrap();
                     let fan_speed = fan_speed_shared.lock().unwrap();
-                    let active = paused_listener.lock().unwrap();
+                    let paused = paused_listener.lock().unwrap();
 
                     let status = Status {
-                        strategy: &name_lock,
+                        strategy: (name_lock).to_string(),
                         speed: *fan_speed,
-                        active: *active,
+                        paused: *paused,
                     };
 
                     let msg = serde_json::to_string(&status).unwrap();
@@ -290,12 +337,12 @@ fn run_daemon() -> std::io::Result<()> {
                 } else if let Some(arguments) = received_trimmed.strip_prefix("print ") {
                     let name_lock = strategy_name.lock().unwrap();
                     let fan_speed = fan_speed_shared.lock().unwrap();
-                    let active = paused_listener.lock().unwrap();
+                    let paused = paused_listener.lock().unwrap();
 
                     let status = Status {
-                        strategy: &name_lock,
+                        strategy: (name_lock).to_string(),
                         speed: *fan_speed,
-                        active: *active,
+                        paused: *paused,
                     };
 
                     let msg = if arguments.trim() == "json" {
@@ -303,7 +350,7 @@ fn run_daemon() -> std::io::Result<()> {
                     } else {
                         format!(
                             "Strategy: {}\nSpeed: {}\nActive: {}",
-                            status.strategy, status.speed, status.active
+                            status.strategy, status.speed, status.paused
                         )
                     };
 
@@ -349,7 +396,7 @@ fn run_daemon() -> std::io::Result<()> {
 }
 
 fn send_to_daemon(msg: String) -> std::io::Result<String> {
-    let mut stream = UnixStream::connect(SOCK_INFO_PATH)?;
+    let mut stream = UnixStream::connect(SOCK_PATH)?;
     stream.write_all(msg.as_bytes())?;
 
     let mut buf = [0u8; 1024];
@@ -394,34 +441,23 @@ fn listen_socket() -> std::io::Result<()> {
     Ok(())
 }
 
-
 fn main() {
     env_logger::init();
-
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
 
     if args.len() > 1 && (args[1] == "--help" || args[1] == "help") {
         print_help();
-        return;
-    }
-
-    if args.len() > 1 && args[1] == "run" {
+    } else if args.len() > 1 && args[1] == "run" {
         if unsafe { libc::geteuid() != 0 } {
             error!("Root privileges required.");
-            exit(1);
+            std::process::exit(1);
         }
-
         if let Err(e) = run_daemon() {
             error!("failed: {}", e);
         }
-        return;
-    }
-
-    if args.len() > 1 && args[1] == "listen" {
+    } else if args.len() > 1 && args[1] == "listen" {
         listen_socket().unwrap();
-    }
-
-    if args.len() > 1 {
+    } else if args.len() > 1 {
         let msg = args[1..].join(" ");
         match send_to_daemon(msg) {
             Ok(response) => println!("{}", response),
