@@ -1,5 +1,7 @@
 use std::env;
 use std::fs;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -16,6 +18,8 @@ use log::{debug, error, info, warn};
 use serde::Serialize;
 
 const SOCK_PATH: &str = "/tmp/fw-fanctrl-rs.sock";
+
+const SOCK_INFO_PATH: &str = "/tmp/fw-fanctrl-info.sock";
 
 mod fan_config;
 mod fan_control;
@@ -95,6 +99,29 @@ fn run_daemon() -> std::io::Result<()> {
         ));
     }
 
+    if Path::new(SOCK_INFO_PATH).exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "daemon already running Socket already exsists?",
+        ));
+    }
+    let clients = Arc::new(Mutex::new(Vec::new()));
+    let info_listener = UnixListener::bind(SOCK_INFO_PATH)?;
+    fs::set_permissions(SOCK_INFO_PATH, fs::Permissions::from_mode(0o666))?;
+    let clients_clone = Arc::clone(&clients);
+
+    thread::spawn(move || {
+        for stream in info_listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let mut clients_lock = clients_clone.lock().unwrap();
+                    clients_lock.push(stream);
+                }
+                Err(e) => eprintln!("Failed to accept client: {}", e),
+            }
+        }
+    });
+
     let listener = UnixListener::bind(SOCK_PATH)?;
     fs::set_permissions(SOCK_PATH, fs::Permissions::from_mode(0o666))?;
 
@@ -127,7 +154,37 @@ fn run_daemon() -> std::io::Result<()> {
     let paused_thread = paused.clone();
     let fan_speed_shared = Arc::new(Mutex::new(0u8));
     let fan_speed_thread = Arc::clone(&fan_speed_shared);
+    let mut last_strategy = String::new();
+    let mut last_speed = 0;
+    let mut last_active = false;
     let fan_thread = thread::spawn(move || loop {
+        {
+            info!("checking changes");
+            let name_lock = strategy_name_clone.lock().unwrap();
+            let fan_speed = fan_speed_thread.lock().unwrap();
+            let active = paused_thread.lock().unwrap();
+
+            if &last_strategy != &*name_lock || last_speed != *fan_speed || last_active != *active {
+                info!("changes detected writing to socket");
+                let status = Status {
+                    strategy: &name_lock,
+                    speed: *fan_speed,
+                    active: *active,
+                };
+
+                if let Ok(msg) = serde_json::to_string(&status) {
+                    let mut clients_lock = clients.lock().unwrap();
+                    clients_lock.retain(|mut client| client.write_all(format!("{}\n", msg).as_bytes()).is_ok());
+                } else {
+                    eprintln!("Failed to serialize status");
+                }
+
+                last_strategy = name_lock.clone();
+                last_speed = *fan_speed;
+                last_active = *active;
+            }
+        }
+
         let sleep_time;
         {
             let is_paused = paused_thread.lock().unwrap();
@@ -227,10 +284,7 @@ fn run_daemon() -> std::io::Result<()> {
                         active: *active,
                     };
 
-                    let msg = format!(
-                        "Strategy: {}\nSpeed: {}\nActive: {}",
-                        status.strategy, status.speed, status.active
-                    );
+                    let msg = serde_json::to_string(&status).unwrap();
 
                     stream.write_all(msg.as_bytes())?;
                 } else if let Some(arguments) = received_trimmed.strip_prefix("print ") {
@@ -295,7 +349,7 @@ fn run_daemon() -> std::io::Result<()> {
 }
 
 fn send_to_daemon(msg: String) -> std::io::Result<String> {
-    let mut stream = UnixStream::connect(SOCK_PATH)?;
+    let mut stream = UnixStream::connect(SOCK_INFO_PATH)?;
     stream.write_all(msg.as_bytes())?;
 
     let mut buf = [0u8; 1024];
@@ -313,10 +367,33 @@ fn print_help() {
     pause           Pause fan control
     resume          Resume fan control
     reload          Reload config
+    listen          listen for changes like fan speed strategy paused
     tool <args>     Run arbitrary framework_tool commands
     help / --help   Show this help message"
     );
 }
+
+fn listen_socket() -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(SOCK_INFO_PATH)?;
+    let mut buffer = [0u8; 1024];
+
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break, // connection closed
+            Ok(n) => {
+                let msg = String::from_utf8_lossy(&buffer[..n]);
+                println!("{}", msg); // only prints when a message is received
+            }
+            Err(e) => {
+                eprintln!("Read error: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 
 fn main() {
     env_logger::init();
@@ -338,6 +415,10 @@ fn main() {
             error!("failed: {}", e);
         }
         return;
+    }
+
+    if args.len() > 1 && args[1] == "listen" {
+        listen_socket().unwrap();
     }
 
     if args.len() > 1 {
