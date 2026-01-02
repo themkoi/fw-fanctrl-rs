@@ -1,12 +1,8 @@
-use std::env;
 use std::fs;
-use std::io::BufRead;
-use std::io::BufReader;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::process::exit;
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -94,24 +90,6 @@ fn parse_temp(input: &str) -> TempParsed {
 
 lazy_static::lazy_static! {
     static ref BROADCAST_LOCK: Mutex<()> = Mutex::new(());
-}
-
-fn broadcast_status(clients: &Arc<Mutex<Vec<UnixStream>>>, status: &Status) {
-    let _guard = BROADCAST_LOCK.lock().unwrap(); // only one broadcast at a time
-
-    if let Ok(msg) = serde_json::to_string(status) {
-        let mut clients_lock = clients.lock().unwrap();
-        clients_lock.retain(|mut client| {
-            if let Err(e) = client.write_all(format!("{}\n", msg).as_bytes()) {
-                eprintln!("Client disconnected: {}", e);
-                false
-            } else {
-                true
-            }
-        });
-    } else {
-        eprintln!("Failed to serialize status");
-    }
 }
 
 fn run_daemon() -> std::io::Result<()> {
@@ -286,7 +264,6 @@ fn run_daemon() -> std::io::Result<()> {
         thread::sleep(Duration::from_secs_f32(sleep_time));
     });
 
-    let status_tx_listener = Arc::clone(&status_tx);
     loop {
         let paused_listener = paused.clone();
 
@@ -428,8 +405,10 @@ fn listen_socket() -> std::io::Result<()> {
         match stream.read(&mut buffer) {
             Ok(0) => break, // connection closed
             Ok(n) => {
-                let msg = String::from_utf8_lossy(&buffer[..n]);
-                println!("{}", msg); // only prints when a message is received
+                let msg = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
+                if !msg.is_empty() {
+                    println!("{}", msg);
+                }
             }
             Err(e) => {
                 eprintln!("Read error: {}", e);
@@ -440,6 +419,7 @@ fn listen_socket() -> std::io::Result<()> {
 
     Ok(())
 }
+
 
 fn main() {
     env_logger::init();
