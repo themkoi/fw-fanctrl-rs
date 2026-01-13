@@ -107,7 +107,6 @@ fn run_daemon() -> std::io::Result<()> {
         ));
     }
     let (status_tx, status_rx) = mpsc::channel::<Status>();
-    let status_tx = Arc::new(status_tx);
     let clients = Arc::new(Mutex::new(Vec::new()));
     let info_listener = UnixListener::bind(SOCK_INFO_PATH)?;
     fs::set_permissions(SOCK_INFO_PATH, fs::Permissions::from_mode(0o666))?;
@@ -124,27 +123,19 @@ fn run_daemon() -> std::io::Result<()> {
             }
         }
     });
-
     let clients_clone = Arc::clone(&clients);
 
     thread::spawn(move || {
-        let clients_lock = clients_clone.lock().unwrap();
-        drop(clients_lock); // release lock initially
-
         for status in status_rx {
-            if let Ok(msg) = serde_json::to_string(&status) {
-                let mut clients_lock = clients.lock().unwrap();
-                clients_lock.retain(|mut client| {
-                    if let Err(e) = client.write_all(format!("{}\n", msg).as_bytes()) {
-                        eprintln!("Client disconnected: {}", e);
-                        false // remove disconnected client
-                    } else {
-                        true
-                    }
-                });
-            } else {
-                eprintln!("Failed to serialize status");
-            }
+            let msg = match serde_json::to_string(&status) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let msg = format!("{msg}\n");
+
+            let mut clients = clients_clone.lock().unwrap();
+            clients.retain_mut(|client| client.write_all(msg.as_bytes()).is_ok());
         }
     });
 
@@ -184,7 +175,8 @@ fn run_daemon() -> std::io::Result<()> {
     let mut last_speed = 0;
     let mut last_active = false;
 
-    let status_tx_fan = Arc::clone(&status_tx);
+    let status_tx_fan = status_tx.clone();
+    let status_tx_profile = status_tx.clone();
 
     let fan_thread = thread::spawn(move || loop {
         {
@@ -201,7 +193,7 @@ fn run_daemon() -> std::io::Result<()> {
                     paused: *paused,
                 };
 
-                let _ = status_tx_fan.send(status);
+                status_tx_fan.send(status).unwrap();
 
                 last_strategy = name_lock.clone();
                 last_speed = *fan_speed;
@@ -290,11 +282,24 @@ fn run_daemon() -> std::io::Result<()> {
 
                         info!("Switched to strategy: {}", name);
                         let msg = format!("Switched to strategy: {}", name);
-                        stream.write_all(msg.as_bytes())?;
+                        let _ = stream.write_all(msg.as_bytes());
+
+                        let name_lock = strategy_name.lock().unwrap();
+                        let fan_speed = fan_speed_shared.lock().unwrap();
+                        let paused = paused_listener.lock().unwrap();
+
+                        info!("changes detected writing to socket");
+                        let status = Status {
+                            strategy: (name_lock).to_string(),
+                            speed: *fan_speed,
+                            paused: *paused,
+                        };
+
+                        status_tx_profile.send(status).unwrap();
                     } else {
                         warn!("Unknown strategy: {}", name);
                         let msg = format!("Unknown strategy: {}", name);
-                        stream.write_all(msg.as_bytes())?;
+                        let _ = stream.write_all(msg.as_bytes());
                     }
                 }
                 if received_trimmed == "print" {
@@ -310,7 +315,7 @@ fn run_daemon() -> std::io::Result<()> {
 
                     let msg = serde_json::to_string(&status).unwrap();
 
-                    stream.write_all(msg.as_bytes())?;
+                    let _ = stream.write_all(msg.as_bytes());
                 } else if let Some(arguments) = received_trimmed.strip_prefix("print ") {
                     let name_lock = strategy_name.lock().unwrap();
                     let fan_speed = fan_speed_shared.lock().unwrap();
@@ -331,7 +336,7 @@ fn run_daemon() -> std::io::Result<()> {
                         )
                     };
 
-                    stream.write_all(msg.as_bytes())?;
+                    let _ = stream.write_all(msg.as_bytes());
                 } else if let Some(arguments) = received_trimmed.strip_prefix("tool ") {
                     let mut cmd = Command::new("framework_tool");
                     for arg in arguments.split_whitespace() {
@@ -339,7 +344,7 @@ fn run_daemon() -> std::io::Result<()> {
                     }
                     let output = cmd.output().expect("framework_tool failed");
                     let stderr = std::str::from_utf8(&output.stderr).unwrap_or("<invalid utf8>");
-                    stream.write_all(stderr.as_bytes())?;
+                    let _ = stream.write_all(stderr.as_bytes());
                 } else if received_trimmed == "reset" {
                     let mut profile = current_strategy.lock().unwrap();
                     *profile = config.strategies[&config.default_strategy.clone()].clone();
@@ -347,7 +352,7 @@ fn run_daemon() -> std::io::Result<()> {
                         "Strategy reset to default! Strategy in use: {}",
                         config.default_strategy
                     );
-                    stream.write_all(msg.as_bytes())?;
+                    let _ = stream.write_all(msg.as_bytes());
                 } else if received_trimmed == "pause" {
                     Command::new("framework_tool")
                         .arg("--autofanctrl")
@@ -355,17 +360,17 @@ fn run_daemon() -> std::io::Result<()> {
                         .expect("framework_tool failed");
                     let mut pause = paused_listener.lock().unwrap();
                     *pause = true;
-                    stream.write_all(b"Service paused!")?;
+                    let _ = stream.write_all(b"Service paused!");
                 } else if received_trimmed == "resume" {
                     let mut pause = paused_listener.lock().unwrap();
                     *pause = false;
                     fan_thread.thread().unpark();
-                    stream.write_all(b"Service resumed!")?;
+                    let _ = stream.write_all(b"Service resumed!");
                 } else if received_trimmed == "reload" {
                     config = fan_config::load_or_create_config().unwrap();
-                    stream.write_all(b"Config reloaded")?;
+                    let _ = stream.write_all(b"Config reloaded");
                 } else {
-                    stream.write_all(b"unknown or unfinished argument")?;
+                    let _ = stream.write_all(b"unknown or unfinished argument");
                 }
             }
         }
@@ -419,7 +424,6 @@ fn listen_socket() -> std::io::Result<()> {
 
     Ok(())
 }
-
 
 fn main() {
     env_logger::init();
