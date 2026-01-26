@@ -429,7 +429,7 @@ fn main() {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() > 1 && (args[1] == "--help" || args[1] == "help") {
+    if args.len() <= 1 || args.iter().any(|a| a == "--help" || a == "help") {
         print_help();
     } else if args.len() > 1 && args[1] == "run" {
         if unsafe { libc::geteuid() != 0 } {
