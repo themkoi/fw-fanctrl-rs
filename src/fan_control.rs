@@ -13,38 +13,29 @@ impl FanController {
     }
 
     pub fn update(&mut self, temperature: f32, strategy: &Strategy) -> f32 {
-        let fan_speed: f32 = self.interpolate(temperature, strategy);
+        if self.buffer.is_empty() {
+            self.buffer.push_back(temperature);
+            return self.interpolate(temperature, strategy);
+        }
 
-        // add to buffer
-        self.buffer.push_back(fan_speed);
+        let prev = *self.buffer.back().unwrap();
+        let alpha = 1.0 / strategy.moving_average_interval.max(1) as f32;
+        let smooth = prev + alpha * (temperature - prev);
+
+        self.buffer.push_back(smooth);
         if self.buffer.len() > strategy.moving_average_interval as usize {
             self.buffer.pop_front();
         }
 
-        // trimmed moving average like Smooth rule
-        let mut values: Vec<f32> = self.buffer.iter().copied().collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let len = values.len();
-        if len == 0 {
-            return 0.0;
-        }
-
-        let trimmed: &[f32] = if len > 2 {
-            let cut = std::cmp::max(1, len / 5);
-            &values[cut..len - cut]
-        } else {
-            &values[..]
-        };
-        let avg: f32 = trimmed.iter().sum::<f32>() / trimmed.len() as f32;
-        avg
+        self.interpolate(smooth, strategy)
     }
 
     fn interpolate(&self, temperature: f32, strategy: &Strategy) -> f32 {
-        if strategy.speed_curve.is_empty() {
+        let points = &strategy.speed_curve;
+        if points.is_empty() {
             return 0.0;
         }
 
-        let points = &strategy.speed_curve;
         if temperature <= points[0].temp {
             return points[0].speed;
         }
