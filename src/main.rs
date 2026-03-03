@@ -111,6 +111,8 @@ fn run_daemon() -> std::io::Result<()> {
     let info_listener = UnixListener::bind(SOCK_INFO_PATH)?;
     fs::set_permissions(SOCK_INFO_PATH, fs::Permissions::from_mode(0o666))?;
     let clients_clone = Arc::clone(&clients);
+    let client_connected = Arc::new(Mutex::new(false));
+    let connected_clone = Arc::clone(&client_connected);
 
     thread::spawn(move || {
         for stream in info_listener.incoming() {
@@ -118,6 +120,7 @@ fn run_daemon() -> std::io::Result<()> {
                 Ok(stream) => {
                     let mut clients_lock = clients_clone.lock().unwrap();
                     clients_lock.push(stream);
+                    *client_connected.lock().unwrap() = true;
                 }
                 Err(e) => eprintln!("Failed to accept client: {}", e),
             }
@@ -185,8 +188,13 @@ fn run_daemon() -> std::io::Result<()> {
             let fan_speed = fan_speed_thread.lock().unwrap();
             let paused = paused_thread.lock().unwrap();
 
-            if &last_strategy != &*name_lock || last_speed != *fan_speed || last_active != *paused {
+            if &last_strategy != &*name_lock
+                || last_speed != *fan_speed
+                || last_active != *paused
+                || *connected_clone.lock().unwrap()
+            {
                 info!("changes detected writing to socket");
+                *connected_clone.lock().unwrap() = false;
                 let status = Status {
                     strategy: (name_lock).to_string(),
                     speed: *fan_speed,
