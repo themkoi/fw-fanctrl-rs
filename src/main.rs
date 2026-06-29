@@ -411,12 +411,21 @@ fn print_help() {
 }
 
 fn listen_socket() -> std::io::Result<()> {
-    let mut stream = UnixStream::connect(SOCK_INFO_PATH)?;
+    let mut stream = loop {
+        match UnixStream::connect(SOCK_INFO_PATH) {
+            Ok(s) => break s,
+            Err(e) => {
+                eprintln!("Socket not available yet ({}), retrying in 1 second...", e);
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    };
+
     let mut buffer = [0u8; 1024];
 
     loop {
         match stream.read(&mut buffer) {
-            Ok(0) => break, // connection closed
+            Ok(0) => break,
             Ok(n) => {
                 let msg = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
                 if !msg.is_empty() {
