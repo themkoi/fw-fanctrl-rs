@@ -227,10 +227,15 @@ fn run_daemon() -> std::io::Result<()> {
             debug!("Update freq: {}", profile.fan_speed_update_frequency);
             debug!("Strategy: {}", *name);
 
-            let temp = Command::new("framework_tool")
-                .arg("--thermal")
-                .output()
-                .expect("framework_tool failed");
+            let temp = Command::new("framework_tool").arg("--thermal").output();
+
+            let temp = match temp {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Failed to run framework_tool: {e}");
+                    return;
+                }
+            };
 
             let stdout = String::from_utf8_lossy(&temp.stdout);
             let parsed = parse_temp(&stdout);
@@ -252,11 +257,17 @@ fn run_daemon() -> std::io::Result<()> {
                 *fan_speed_lock = fan_speed_full;
             }
             debug!("Fan speed: {}", fan_speed_full);
-            let output = Command::new("framework_tool")
+            let output = match Command::new("framework_tool")
                 .arg("--fansetduty")
                 .arg(fan_speed_full.to_string())
                 .output()
-                .expect("framework_tool failed");
+            {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("Failed to run framework_tool: {e}");
+                    return;
+                }
+            };
             let stderr = str::from_utf8(&output.stderr).unwrap_or("<invalid utf8>");
             debug!("stderr: {}", stderr);
         }
